@@ -20,9 +20,86 @@ from typing import Any, Callable, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.custom_batching import custom_vmap
 
 import cuequivariance as cue
 import cuequivariance_jax as cuex  # noqa: F401
+
+
+@custom_vmap
+def _any_active_steps(remaining: jax.Array) -> jax.Array:
+    return remaining > 0
+
+
+@_any_active_steps.def_vmap
+def _any_active_steps_vmap(axis_size, in_batched, remaining):
+    # A shared skip predicate must stay scalar under nested vmap. Individual
+    # derivatives are still masked separately inside the active branch.
+    return _any_active_steps(jnp.max(remaining, axis=0, initial=0)), False
+
+
+def _ldexp_complex(A: jax.Array, exponent: jax.Array) -> jax.Array:
+    return jnp.ldexp(A.real, exponent) + 1j * jnp.ldexp(A.imag, exponent)
+
+
+@jax.custom_jvp
+def _expm_skew_hermitian(A: jax.Array) -> jax.Array:
+    m, V = jnp.linalg.eigh(1j * A)
+    return (V * jnp.exp(-1j * m)) @ V.T.conj()
+
+
+@_expm_skew_hermitian.defjvp
+def _expm_skew_hermitian_jvp(primals, tangents):
+    (A,) = primals
+    (dA,) = tangents
+    # Match eigh's Hermitian projection, including complex rotation angles.
+    dtype = jnp.result_type(A, 1j)
+    S = (A / 2 - A.T.conj() / 2).astype(dtype)
+    E = (dA / 2 - dA.T.conj() / 2).astype(dtype)
+
+    # Scale only the primal: a small-norm Fréchet evaluation avoids both
+    # eigenvector derivatives at repeated eigenvalues and large-angle Padé error.
+    guard = (2 * A.shape[0] - 1).bit_length()
+    magnitude = jnp.maximum(jnp.max(jnp.abs(S.real)), jnp.max(jnp.abs(S.imag)))
+    exponent = jnp.frexp(magnitude)[1]
+    squarings = jnp.where(magnitude == 0, 0, jnp.maximum(0, exponent + guard))
+    B = _ldexp_complex(S, -squarings)
+    # ||B||_1 < 1/sqrt(2). These derivative-series tails are below the
+    # corresponding machine epsilon, without a tangent-dependent branch.
+    terms = 18 if A.real.dtype == jnp.float64 else 10
+
+    def taylor_step(carry, k):
+        power, tangent, total = carry
+        tangent = (B @ tangent + E @ power) / k
+        power = (B @ power) / k
+        return (power, tangent, total + tangent), None
+
+    initial = (jnp.eye(A.shape[0], dtype=dtype), jnp.zeros_like(B), jnp.zeros_like(B))
+    (_, _, derivative), _ = jax.lax.scan(taylor_step, initial, jnp.arange(1, terms + 1))
+
+    def step(derivative, k):
+        def double(derivative):
+            # Fresh spectral phases avoid accumulated squaring error. Calling
+            # the wrapped function also keeps higher derivatives off eigh.
+            R = _expm_skew_hermitian(_ldexp_complex(S, k - squarings))
+            doubled = (R @ derivative) / 2 + (derivative @ R) / 2
+            return jnp.where(k < squarings, doubled, derivative)
+
+        return (
+            jax.lax.cond(
+                _any_active_steps(squarings - k), double, lambda d: d, derivative
+            ),
+            None,
+        )
+
+    # A static scan supports reverse mode; skip beyond the largest active lane.
+    limit = jnp.finfo(A.real.dtype).maxexp + guard
+    derivative, _ = jax.lax.scan(step, derivative, jnp.arange(limit))
+    return _expm_skew_hermitian(A), derivative
+
+
+def _expm_skew_symmetric(A: jax.Array) -> jax.Array:
+    return jnp.real(_expm_skew_hermitian(A))
 
 
 @dataclass(frozen=True, init=False, repr=False)
@@ -331,21 +408,19 @@ class RepArray:
                    [-1.,  1.,  1.]]...)
         """
 
+        v_arr = jnp.asarray(v)
+        target_dtype = jnp.promote_types(v_arr.dtype, jnp.float32)
+        v_inexact = v_arr.astype(target_dtype)
+
         def matrix(rep: cue.Rep) -> jax.Array:
             X = rep.X
             assert np.allclose(
                 X, -X.conj().transpose((0, 2, 1))
             )  # TODO: support other types of X
 
-            X = jnp.asarray(X, dtype=v.dtype)
-            iX = 1j * jnp.einsum("a,aij->ij", v, X)
-            m, V = jnp.linalg.eigh(iX)
-            # np.testing.assert_allclose(V @ np.diag(m) @ V.T.conj(), iX, atol=1e-10)
-
-            phase = jnp.exp(-1j * m)
-            R = V @ jnp.diag(phase) @ V.T.conj()
-            R = jnp.real(R)
-            return R
+            X = jnp.asarray(X, dtype=v_inexact.dtype)
+            Lie = jnp.einsum("a,aij->ij", v_inexact, X)
+            return _expm_skew_symmetric(Lie)
 
         if self.is_irreps_array():
 
